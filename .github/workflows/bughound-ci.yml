@@ -1,0 +1,331 @@
+
+name: BugHound Isolated CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticket_id:
+        description: BugHound ticket ID
+        required: true
+        type: string
+      phase:
+        description: Execution phase
+        required: true
+        type: choice
+        options:
+          - patch_tests
+          - post_pr_verification
+      run_id:
+        description: BugHound execution UUID
+        required: true
+        type: string
+      repository:
+        description: Target owner/repository
+        required: true
+        type: string
+      repository_url:
+        description: Canonical GitHub repository URL
+        required: true
+        type: string
+      base_branch:
+        description: Original base branch
+        required: true
+        type: string
+      base_commit_sha:
+        description: Original base commit SHA
+        required: true
+        type: string
+      resulting_commit_sha:
+        description: Resulting PR commit SHA
+        required: false
+        type: string
+      patch_encoding:
+        description: Patch encoding
+        required: false
+        type: string
+      patch_b64:
+        description: Compressed Base64 patch
+        required: false
+        type: string
+      patch_sha256:
+        description: Original patch SHA256
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Isolated target repository tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Validate dispatch metadata
+        shell: bash
+        env:
+          TICKET_ID: ${{ inputs.ticket_id }}
+          PHASE: ${{ inputs.phase }}
+          RUN_ID: ${{ inputs.run_id }}
+          REPOSITORY: ${{ inputs.repository }}
+          REPOSITORY_URL: ${{ inputs.repository_url }}
+          BASE_SHA: ${{ inputs.base_commit_sha }}
+          RESULT_SHA: ${{ inputs.resulting_commit_sha }}
+          PATCH_ENCODING: ${{ inputs.patch_encoding }}
+          PATCH_B64: ${{ inputs.patch_b64 }}
+          PATCH_SHA: ${{ inputs.patch_sha256 }}
+        run: |
+          set -euo pipefail
+
+          [[ "$TICKET_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RUN_ID" =~ ^[A-Za-z0-9-]{1,100}$ ]]
+          [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$BASE_SHA" =~ ^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$ ]]
+
+          EXPECTED_URL="https://github.com/${REPOSITORY}"
+          [[ "$REPOSITORY_URL" == "$EXPECTED_URL" ]]
+
+          if [[ "$PHASE" == "patch_tests" ]]; then
+            [[ "$PATCH_ENCODING" == "zlib+base64" ]]
+            [[ -n "$PATCH_B64" ]]
+            [[ "$PATCH_SHA" =~ ^[0-9a-f]{64}$ ]]
+            [[ -z "$RESULT_SHA" ]]
+          elif [[ "$PHASE" == "post_pr_verification" ]]; then
+            [[ -z "$PATCH_B64" ]]
+            [[ -z "$PATCH_SHA" ]]
+            [[ -z "$PATCH_ENCODING" ]]
+            [[ "$RESULT_SHA" =~ ^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$ ]]
+          else
+            exit 1
+          fi
+
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.phase == 'patch_tests' && inputs.base_commit_sha || inputs.resulting_commit_sha }}
+          path: target
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node
+        if: hashFiles('target/package-lock.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Verify and apply patch
+        if: inputs.phase == 'patch_tests'
+        shell: bash
+        env:
+          PATCH_B64: ${{ inputs.patch_b64 }}
+          PATCH_SHA: ${{ inputs.patch_sha256 }}
+        run: |
+          set -euo pipefail
+          set +x
+
+          python - <<'PY'
+          import base64
+          import hashlib
+          import os
+          import zlib
+          from pathlib import Path
+
+          encoded = os.environ["PATCH_B64"]
+          expected = os.environ["PATCH_SHA"]
+
+          compressed = base64.b64decode(encoded, validate=True)
+
+          decoder = zlib.decompressobj()
+          patch = decoder.decompress(compressed, 256 * 1024 + 1)
+
+          if len(patch) > 256 * 1024 or decoder.unconsumed_tail:
+              raise SystemExit("Patch exceeds decompressed size limit")
+
+          if not decoder.eof or decoder.unused_data:
+              raise SystemExit("Invalid compressed patch stream")
+          actual = hashlib.sha256(patch).hexdigest()
+
+          if actual != expected:
+              raise SystemExit("Patch SHA-256 mismatch")
+
+          Path(os.environ["RUNNER_TEMP"], "bughound.patch").write_bytes(patch)
+          PY
+
+          git -C target apply --check "$RUNNER_TEMP/bughound.patch"
+          git -C target apply "$RUNNER_TEMP/bughound.patch"
+
+      - name: Install dependencies and execute build/tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd target
+
+          BUILD_SUPPORTED=0
+          TEST_SUPPORTED=0
+
+          if [[ -f package.json ]]; then
+            if [[ ! -f package-lock.json ]]; then
+              echo "Node project requires package-lock.json"
+              exit 1
+            fi
+
+            npm ci
+
+            HAS_BUILD=$(node -e "const p=require('./package.json'); process.stdout.write(p.scripts?.build ? 'yes' : 'no')")
+
+            if [[ "$HAS_BUILD" != "yes" ]]; then
+              echo "Node project has no build script"
+              exit 1
+            fi
+
+            npm run build
+            BUILD_SUPPORTED=1
+
+            HAS_TEST=$(node -e "const p=require('./package.json'); process.stdout.write(p.scripts?.test ? 'yes' : 'no')")
+
+            if [[ "$HAS_TEST" == "yes" ]]; then
+              npm test
+              TEST_SUPPORTED=1
+            fi
+          fi
+
+          if [[ -f requirements.txt || -f pyproject.toml || -f setup.py ]]; then
+            if [[ -f requirements.txt ]]; then
+              python -m pip install -r requirements.txt
+            else
+              python -m pip install -e .
+            fi
+
+            python -m pip install pytest
+
+            python -m compileall -q .
+
+            BUILD_SUPPORTED=1
+
+            if find . -type f \( -name 'test_*.py' -o -name '*_test.py' \) \
+              -not -path './.git/*' | grep -q .; then
+              python -m pytest -q
+              TEST_SUPPORTED=1
+            fi
+          fi
+
+          if [[ "$BUILD_SUPPORTED" -ne 1 ]]; then
+            echo "No supported project build configuration found"
+            exit 1
+          fi
+
+          if [[ "$TEST_SUPPORTED" -ne 1 ]]; then
+            echo "No supported automated test suite found"
+            exit 1
+          fi
+
+  report:
+    name: Publish trusted execution result
+    runs-on: ubuntu-latest
+    needs:
+      - test
+    if: always()
+    timeout-minutes: 5
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Create trusted result artifact
+        shell: bash
+        env:
+          TICKET_ID: ${{ inputs.ticket_id }}
+          PHASE: ${{ inputs.phase }}
+          RUN_ID: ${{ inputs.run_id }}
+          BASE_SHA: ${{ inputs.base_commit_sha }}
+          RESULT_SHA: ${{ inputs.resulting_commit_sha }}
+          PATCH_SHA: ${{ inputs.patch_sha256 }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p result
+
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          phase = os.environ["PHASE"]
+          test_result = os.environ["TEST_RESULT"]
+
+          if test_result == "success":
+              status = "passed"
+              executed = True
+              exit_code = 0
+              summary = "Build and automated tests passed."
+          elif test_result == "cancelled":
+              status = "cancelled"
+              executed = False
+              exit_code = None
+              summary = "GitHub Actions test job was cancelled."
+          else:
+              status = "failed"
+              executed = True
+              exit_code = 1
+              summary = "Isolated CI job failed; inspect GitHub Actions logs for details."
+
+          verification = None
+
+          if phase == "post_pr_verification":
+              verification = {
+                  "build": "passed" if status == "passed" else "failed",
+                  "tests": "passed" if status == "passed" else "failed",
+                  "deployment": "not_configured",
+                  "health_check": "not_configured"
+              }
+
+          result = {
+              "ticket_id": int(os.environ["TICKET_ID"]),
+              "run_id": os.environ["RUN_ID"],
+              "phase": phase,
+              "status": status,
+              "executed": executed,
+              "exit_code": exit_code,
+              "base_commit_sha": os.environ["BASE_SHA"],
+              "patch_sha256": (
+                  os.environ["PATCH_SHA"]
+                  if phase == "patch_tests"
+                  else None
+              ),
+              "tested_commit_sha": (
+                  os.environ["RESULT_SHA"]
+                  if phase == "post_pr_verification"
+                  else None
+              ),
+              "summary": summary,
+              "logs": "",
+              "verification": verification,
+              "completed_at": datetime.now(timezone.utc).isoformat()
+          }
+
+          Path("result/result.json").write_text(
+              json.dumps(result, separators=(",", ":")),
+              encoding="utf-8"
+          )
+          PY
+
+      - name: Upload BugHound result
+        uses: actions/upload-artifact@v4
+        with:
+          name: bughound-result
+          path: result/result.json
+          if-no-files-found: error
+          retention-days: 3

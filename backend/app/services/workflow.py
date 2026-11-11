@@ -638,17 +638,33 @@ def _dispatch_tests(
     db.commit()
 
     try:
-        dispatch(
+        dispatch_result = dispatch(
             ticket,
             phase=phase,
             run_id=runner_run_id,
             patch_diff=patch_diff,
         )
 
+        if (
+            not isinstance(dispatch_result, dict)
+            or dispatch_result.get("run_id") != runner_run_id
+            or dispatch_result.get("accepted") is not True
+            or type(dispatch_result.get("workflow_run_id")) is not int
+            or dispatch_result["workflow_run_id"] <= 0
+        ):
+            raise WorkflowError(
+                "GitHub Actions dispatch returned invalid correlation data"
+            )
+
         if run.status == "running":
             run.output_data = {
                 **(run.output_data or {}),
                 "accepted": True,
+                "workflow_run_id": dispatch_result["workflow_run_id"],
+                "workflow_run_api_url": dispatch_result["run_url"],
+                "workflow_run_html_url": dispatch_result["html_url"],
+                "payload_bytes": dispatch_result["payload_bytes"],
+                "patch_sha256": dispatch_result["patch_sha256"],
             }
 
             if phase == "patch_tests":
@@ -990,34 +1006,28 @@ def retry_patch_after_test_failure(
         db.close()
 
 
-def mark_runner_result(
+def _record_runner_result(
     ticket_id: int,
     result: dict,
-    callback_secret: str,
+    *,
+    expected_workflow_run_id: int | None = None,
 ) -> tuple[str, bool]:
-    """Validate and persist an external CI runner callback."""
+    """Persist a result correlated to the exact active runner execution."""
 
-    if (
-        not settings.runner_callback_secret
-        or callback_secret != settings.runner_callback_secret
-    ):
-        raise WorkflowError(
-            "Invalid runner callback authorization"
-        )
+    if not isinstance(result, dict):
+        raise WorkflowError("Runner result must be an object")
 
     phase = result.get("phase")
     state = result.get("status")
-    run_id = str(result.get("run_id", ""))
+    run_id = result.get("run_id")
 
     if (
         phase not in {"patch_tests", "post_pr_verification"}
         or state not in {"passed", "failed", "cancelled"}
+        or not isinstance(run_id, str)
         or not run_id
     ):
-        raise WorkflowError(
-            "Runner callback must include a known phase, run_id, "
-            "and actual status"
-        )
+        raise WorkflowError("Runner result has invalid phase, status, or run ID")
 
     run_url = result.get("run_url")
     exit_code = result.get("exit_code")
@@ -1025,14 +1035,25 @@ def mark_runner_result(
     if state == "passed":
         if (
             result.get("executed") is not True
+            or type(exit_code) is not int
             or exit_code != 0
             or not isinstance(run_url, str)
             or not run_url.startswith("https://")
         ):
             raise WorkflowError(
-                "A passing callback requires executed=true, "
-                "exit_code=0, and an HTTPS CI run URL"
+                "Passing result requires executed=true, exit_code=0, and HTTPS run URL"
             )
+
+    if state == "failed":
+        if result.get("executed") is True:
+            if type(exit_code) is not int or exit_code == 0:
+                raise WorkflowError("Executed failure requires a non-zero exit code")
+        elif exit_code is not None:
+            raise WorkflowError("Non-executed failure cannot have an exit code")
+
+    if state == "cancelled":
+        if exit_code is not None and type(exit_code) is not int:
+            raise WorkflowError("Invalid cancellation exit code")
 
     verification = result.get("verification")
 
@@ -1041,22 +1062,10 @@ def mark_runner_result(
             not isinstance(verification, dict)
             or verification.get("build") != "passed"
             or verification.get("tests") != "passed"
+            or verification.get("deployment") not in {"passed", "not_configured"}
+            or verification.get("health_check") not in {"passed", "not_configured"}
         ):
-            raise WorkflowError(
-                "Post-PR success requires actual passing "
-                "build and test results"
-            )
-
-        if (
-            verification.get("deployment")
-            not in {"passed", "not_configured"}
-            or verification.get("health_check")
-            not in {"passed", "not_configured"}
-        ):
-            raise WorkflowError(
-                "Post-PR deployment and health-check results "
-                "must pass or be explicitly not_configured"
-            )
+            raise WorkflowError("Post-PR success requirements are not satisfied")
 
     db = get_session_factory()()
 
@@ -1066,7 +1075,7 @@ def mark_runner_result(
         if ticket is None:
             raise WorkflowError("Ticket not found")
 
-        run = db.scalar(
+        active_runs = db.scalars(
             select(AgentRun)
             .where(
                 AgentRun.ticket_id == ticket_id,
@@ -1074,39 +1083,61 @@ def mark_runner_result(
                 AgentRun.status == "running",
             )
             .order_by(AgentRun.id.desc())
+            .with_for_update()
+        ).all()
+
+        run = next(
+            (
+                item
+                for item in active_runs
+                if item.output_data
+                and item.output_data.get("runner_run_id") == run_id
+                and item.output_data.get("phase") == phase
+            ),
+            None,
         )
 
-        if (
-            run is None
-            or not run.output_data
-            or run.output_data.get("runner_run_id") != run_id
-            or run.output_data.get("phase") != phase
-        ):
-            raise WorkflowError(
-                "No matching active runner execution was found"
-            )
+        if run is None:
+            raise WorkflowError("No matching active runner execution was found")
+
+        run_output = run.output_data or {}
+
+        if expected_workflow_run_id is not None:
+            if (
+                type(expected_workflow_run_id) is not int
+                or expected_workflow_run_id <= 0
+                or run_output.get("workflow_run_id") != expected_workflow_run_id
+            ):
+                raise WorkflowError("GitHub Actions workflow run ID mismatch")
+
+        run_input = run.input_data or {}
 
         if phase == "patch_tests":
             if (
                 result.get("base_commit_sha") != ticket.base_commit_sha
-                or result.get("patch_sha256")
-                != run.input_data.get("patch_sha256")
+                or result.get("patch_sha256") != run_input.get("patch_sha256")
             ):
                 raise WorkflowError(
-                    "Patch test result does not match the ticket "
-                    "base commit and generated diff"
+                    "Patch result does not match ticket base commit and generated diff"
                 )
 
-        elif result.get("tested_commit_sha") != ticket.resulting_commit_sha:
-            raise WorkflowError(
-                "Post-PR result does not match the approved GitHub commit"
-            )
+            if result.get("tested_commit_sha") is not None:
+                raise WorkflowError("Unexpected tested commit in patch result")
+
+        else:
+            if result.get("tested_commit_sha") != ticket.resulting_commit_sha:
+                raise WorkflowError(
+                    "Post-PR result does not match the approved GitHub commit"
+                )
 
         report = {
             "status": state,
             "phase": phase,
             "run_id": run_id,
-            "exit_code": result.get("exit_code"),
+            "workflow_run_id": run_output.get("workflow_run_id"),
+            "workflow_run_api_url": run_output.get("workflow_run_api_url"),
+            "workflow_run_html_url": run_output.get("workflow_run_html_url"),
+            "exit_code": exit_code,
             "summary": str(result.get("summary", ""))[:4000],
             "logs": str(result.get("logs", ""))[-20000:],
             "run_url": run_url,
@@ -1124,64 +1155,64 @@ def mark_runner_result(
         if phase == "patch_tests":
             ticket.test_status = state
             ticket.test_report = report
-
-            ticket.status = (
-                "awaiting_approval"
-                if state == "passed"
-                else "tests_failed"
-            )
-
-            ticket.stage = (
-                "awaiting_approval"
-                if state == "passed"
-                else "agent4"
-            )
+            ticket.status = "awaiting_approval" if state == "passed" else "tests_failed"
+            ticket.stage = "awaiting_approval" if state == "passed" else "agent4"
 
             _audit(
                 db,
                 ticket_id,
                 "patch_tests_completed",
-                {
-                    "status": state,
-                    "run_id": run_id,
-                },
+                {"status": state, "run_id": run_id},
             )
 
-            retry = (
-                state == "failed"
-                and ticket.test_retry_count < 1
-            )
+            retry = state == "failed" and ticket.test_retry_count < 1
 
         else:
             ticket.verification_status = state
-
-            ticket.status = (
-                "resolved"
-                if state == "passed"
-                else "verification_failed"
-            )
-
-            ticket.stage = (
-                "resolved"
-                if state == "passed"
-                else "post_pr_verification"
-            )
+            ticket.status = "resolved" if state == "passed" else "verification_failed"
+            ticket.stage = "resolved" if state == "passed" else "post_pr_verification"
 
             _audit(
                 db,
                 ticket_id,
                 "post_pr_verification_completed",
-                {
-                    "status": state,
-                    "run_id": run_id,
-                },
+                {"status": state, "run_id": run_id},
             )
 
             retry = False
 
         db.commit()
-
         return phase, retry
 
     finally:
         db.close()
+
+
+def record_actions_result(
+    ticket_id: int,
+    result: dict,
+    workflow_run_id: int,
+) -> tuple[str, bool]:
+    """Accept only results obtained from a verified GitHub Actions artifact."""
+
+    return _record_runner_result(
+        ticket_id,
+        result,
+        expected_workflow_run_id=workflow_run_id,
+    )
+
+
+def mark_runner_result(
+    ticket_id: int,
+    result: dict,
+    callback_secret: str,
+) -> tuple[str, bool]:
+    """Legacy callback entry point; retained for compatibility."""
+
+    if (
+        not settings.runner_callback_secret
+        or callback_secret != settings.runner_callback_secret
+    ):
+        raise WorkflowError("Invalid runner callback authorization")
+
+    return _record_runner_result(ticket_id, result)

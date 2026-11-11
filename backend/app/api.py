@@ -259,11 +259,36 @@ def approve_ticket(
     db.add(run)
     db.commit()
     try:
-        dispatch(ticket, phase="post_pr_verification", run_id=runner_run_id)
+        dispatch_result = dispatch(
+            ticket,
+            phase="post_pr_verification",
+            run_id=runner_run_id,
+        )
+
+        if (
+            not isinstance(dispatch_result, dict)
+            or dispatch_result.get("run_id") != runner_run_id
+            or dispatch_result.get("accepted") is not True
+            or type(dispatch_result.get("workflow_run_id")) is not int
+            or dispatch_result["workflow_run_id"] <= 0
+        ):
+            raise WorkflowError(
+                "GitHub Actions dispatch returned invalid correlation data"
+            )
+
         db.refresh(run)
         db.refresh(ticket)
+
         if run.status == "running":
-            run.output_data = {**(run.output_data or {}), "accepted": True}
+            run.output_data = {
+                **(run.output_data or {}),
+                "accepted": True,
+                "workflow_run_id": dispatch_result["workflow_run_id"],
+                "workflow_run_api_url": dispatch_result["run_url"],
+                "workflow_run_html_url": dispatch_result["html_url"],
+                "payload_bytes": dispatch_result["payload_bytes"],
+                "patch_sha256": dispatch_result["patch_sha256"],
+            }
             ticket.verification_status = "running"
             db.commit()
     except Exception as error:
@@ -341,5 +366,11 @@ def integration_status(admin: User = Depends(require_admin)) -> dict:
         "github_read_configured": True,
         "github_write_configured": bool(settings.github_token),
         "authorized_repository_count": len(settings.authorized_repository_set),
-        "external_runner_configured": bool(settings.ci_runner_url and settings.ci_runner_token and settings.runner_callback_secret),
+        "github_actions_configured": settings.github_actions_configured,
+        "github_actions_repository": settings.bughound_actions_repository,
+        "github_actions_workflow": settings.bughound_actions_workflow,
+        "github_actions_ref": settings.bughound_actions_ref,
+        "github_actions_poll_interval_seconds": settings.github_actions_poll_interval_seconds,
+        "github_actions_run_timeout_seconds": settings.github_actions_run_timeout_seconds,
+        "github_actions_max_dispatch_bytes": settings.github_actions_max_dispatch_bytes,
     }

@@ -1,44 +1,218 @@
+
+import base64
 import hashlib
+import json
+import re
+import zlib
+from urllib.parse import quote
 
 import httpx
 
 from app.core.config import settings
 
 
+GITHUB_API_URL = "https://api.github.com"
+GITHUB_API_VERSION = "2022-11-28"
+
+ALLOWED_PHASES = {
+    "patch_tests",
+    "post_pr_verification",
+}
+
+MAX_WORKFLOW_INPUTS = 25
+
+
 class RunnerError(RuntimeError):
-    pass
+    """Raised when GitHub Actions dispatch cannot be completed safely."""
 
 
-def dispatch(ticket, *, phase: str, run_id: str, patch_diff: str | None = None) -> dict:
-    if not settings.ci_runner_url or not settings.ci_runner_token or not settings.runner_callback_secret:
-        raise RunnerError("External isolated CI runner is not configured; no repository code was executed")
-    payload = {
-        "ticket_id": ticket.id,
+def _encode_patch(patch_diff: str | None) -> tuple[str, str, str]:
+    """Return compressed patch, SHA-256 and encoding metadata."""
+
+    if patch_diff is None:
+        return "", "", "zlib+base64"
+
+    raw = patch_diff.encode("utf-8")
+
+    if not raw:
+        raise RunnerError("Patch is empty")
+
+    digest = hashlib.sha256(raw).hexdigest()
+    compressed = zlib.compress(raw, level=9)
+    encoded = base64.b64encode(compressed).decode("ascii")
+
+    return encoded, digest, "zlib+base64"
+
+
+def _build_inputs(
+    ticket,
+    *,
+    phase: str,
+    run_id: str,
+    patch_diff: str | None,
+) -> dict[str, str]:
+    if phase not in ALLOWED_PHASES:
+        raise RunnerError("Unsupported CI execution phase")
+
+    if not run_id or len(run_id) > 100:
+        raise RunnerError("Invalid execution correlation ID")
+
+    if phase == "patch_tests" and patch_diff is None:
+        raise RunnerError("Patch testing requires a patch")
+
+    if phase == "post_pr_verification" and patch_diff is not None:
+        raise RunnerError("Post-PR verification must use the committed repository state")
+
+    patch_b64, patch_sha256, patch_encoding = _encode_patch(
+        patch_diff
+    )
+
+    inputs = {
+        "ticket_id": str(ticket.id),
         "phase": phase,
         "run_id": run_id,
-        "repository": ticket.repository,
-        "repository_url": ticket.repository_url,
-        "base_branch": ticket.base_branch,
-        "base_commit_sha": ticket.base_commit_sha,
-        "fix_branch": ticket.fix_branch,
-        "patch_diff": patch_diff,
-        "patch_sha256": hashlib.sha256(patch_diff.encode("utf-8")).hexdigest() if patch_diff is not None else None,
-        "resulting_commit_sha": ticket.resulting_commit_sha,
-        "callback_url": f"{settings.public_api_url.rstrip('/')}/api/runner/tickets/{ticket.id}/result",
+        "repository": str(ticket.repository),
+        "repository_url": str(ticket.repository_url),
+        "base_branch": str(ticket.base_branch or ""),
+        "base_commit_sha": str(ticket.base_commit_sha or ""),
+        "resulting_commit_sha": str(
+            ticket.resulting_commit_sha or ""
+        ),
+        "patch_encoding": patch_encoding,
+        "patch_b64": patch_b64,
+        "patch_sha256": patch_sha256,
     }
-    try:
-        response = httpx.post(
-            settings.ci_runner_url,
-            json=payload,
-            headers={"Authorization": f"Bearer {settings.ci_runner_token}"},
-            timeout=20,
+
+    if len(inputs) > MAX_WORKFLOW_INPUTS:
+        raise RunnerError("Workflow input count exceeds GitHub's limit")
+
+    return inputs
+
+
+def dispatch(
+    ticket,
+    *,
+    phase: str,
+    run_id: str,
+    patch_diff: str | None = None,
+) -> dict:
+    """Dispatch an isolated GitHub Actions workflow execution."""
+
+    if not settings.github_actions_configured:
+        raise RunnerError(
+            "GitHub Actions integration is not configured"
         )
-        response.raise_for_status()
+
+    repository = settings.bughound_actions_repository.strip()
+
+    if not re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",
+        repository,
+    ):
+        raise RunnerError("Invalid BugHound Actions repository")
+
+    inputs = _build_inputs(
+        ticket,
+        phase=phase,
+        run_id=run_id,
+        patch_diff=patch_diff,
+    )
+
+    body = {
+        "ref": settings.bughound_actions_ref,
+        "inputs": inputs,
+        "return_run_details": True,
+    }
+
+    serialized_body = json.dumps(
+        body,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+
+    if len(serialized_body) > settings.github_actions_max_dispatch_bytes:
+        raise RunnerError(
+            "Compressed workflow payload exceeds the configured size limit"
+        )
+
+    workflow = quote(
+        settings.bughound_actions_workflow,
+        safe="",
+    )
+
+    endpoint = (
+        f"{GITHUB_API_URL}/repos/{repository}"
+        f"/actions/workflows/{workflow}/dispatches"
+    )
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {settings.github_actions_token}",
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        "Content-Type": "application/json",
+    }
+
+    try:
+        with httpx.Client(
+            timeout=30,
+            follow_redirects=False,
+        ) as client:
+            response = client.post(
+                endpoint,
+                content=serialized_body,
+                headers=headers,
+            )
+
+        if response.status_code != 200:
+            if response.status_code == 204:
+                raise RunnerError(
+                    "GitHub accepted dispatch but returned no run details; "
+                    "execution cannot be safely correlated"
+                )
+
+            raise RunnerError(
+                f"GitHub Actions dispatch failed with HTTP "
+                f"{response.status_code}"
+            )
+
         result = response.json()
-        if not result.get("run_id"):
-            raise RunnerError("Runner did not return a run_id; no test result is recorded")
-        if str(result["run_id"]) != run_id:
-            raise RunnerError("Runner must echo the supplied run_id to bind callbacks to the persisted execution")
-        return result
-    except (httpx.HTTPError, ValueError) as error:
-        raise RunnerError(f"CI runner dispatch failed: {error}") from error
+
+    except RunnerError:
+        raise
+    except (httpx.HTTPError, ValueError):
+        raise RunnerError(
+            "GitHub Actions dispatch request failed"
+        ) from None
+
+    workflow_run_id = result.get("workflow_run_id")
+    run_url = result.get("run_url")
+    html_url = result.get("html_url")
+
+    if not isinstance(workflow_run_id, int) or workflow_run_id <= 0:
+        raise RunnerError(
+            "GitHub did not return a valid workflow run ID"
+        )
+
+    if not isinstance(run_url, str) or not run_url.startswith(
+        "https://api.github.com/"
+    ):
+        raise RunnerError(
+            "GitHub returned an invalid workflow API URL"
+        )
+
+    if not isinstance(html_url, str) or not html_url.startswith(
+        "https://github.com/"
+    ):
+        raise RunnerError(
+            "GitHub returned an invalid workflow web URL"
+        )
+
+    return {
+        "run_id": run_id,
+        "workflow_run_id": workflow_run_id,
+        "run_url": run_url,
+        "html_url": html_url,
+        "accepted": True,
+        "payload_bytes": len(serialized_body),
+        "patch_sha256": inputs["patch_sha256"],
+    }
