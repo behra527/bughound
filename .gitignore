@@ -1,0 +1,52 @@
+﻿# Environment and secrets
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+**/!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.db
+*.sqlite3
+
+# Virtual environments
+.venv/
+.venv_clean/
+venv/
+env/
+
+# Node.js / frontend
+node_modules/
+dist/
+build/
+coverage/
+.vite/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Credentials and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+!.env.example
+!**/.env.example
